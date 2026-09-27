@@ -1,0 +1,229 @@
+# -*- coding: utf-8 -*-
+"""
+BreakOutSketchGeometry.FCMacro
+
+Extract one or more edges from an active sketch into their own sketch.
+"""
+
+import re
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtGui
+
+GEO_UNDEF = -2000
+H_AXIS = -1
+V_AXIS = -2
+TITLE = "Break out sketch geometry"
+
+# ExpressionEngine paths
+EXPR_CON_INDEX = re.compile(r"^\.?Constraints\[(\d+)\]$")
+EXPR_CON_NAME = re.compile(r"^\.?Constraints\.(.+)$")
+
+
+def warn(msg):
+    QtGui.QMessageBox.warning(Gui.getMainWindow(), TITLE, msg)
+
+
+def get_sketch_in_edit():
+    gdoc = Gui.ActiveDocument
+    if gdoc is None:
+        return None
+    vp = gdoc.getInEdit()
+    if vp is None:
+        return None
+    obj = vp.Object
+    if obj.TypeId != "Sketcher::SketchObject":
+        return None
+    return obj
+
+
+def selected_geo_ids(sketch):
+    ids = set()
+    for sel in Gui.Selection.getSelectionEx():
+        for sub in sel.SubElementNames:
+            if sel.Object != sketch and (sketch.Name + ".") not in sub:
+                continue
+            elem = sub.split(".")[-1]
+            # Filter out external edges (they start with ExternalEdge)
+            if elem.startswith("Edge"):
+                try:
+                    ids.add(int(elem[4:]) - 1)
+                except ValueError:
+                    pass
+    return sorted(i for i in ids if 0 <= i < len(sketch.Geometry))
+
+
+def copy_geometry(sketch, new, ids):
+    """Add selected geometry to `new` in two batched calls (one per construction
+    state) to avoid a solve per edge. Returns {old_geo_id: new_geo_id}."""
+    normal = [i for i in ids if not sketch.getConstruction(i)]
+    construction = [i for i in ids if sketch.getConstruction(i)]
+    geos = sketch.Geometry
+    geo_map = {}
+    for group, is_construction in ((normal, False), (construction, True)):
+        if not group:
+            continue
+        start = len(new.Geometry)
+        new.addGeometry([geos[i] for i in group], is_construction)
+        for offset, old in enumerate(group):
+            geo_map[old] = start + offset
+    return geo_map
+
+
+def copy_constraints(sketch, new, geo_map):
+    """Copy constraints whose every reference is a selected edge, an axis, or
+    unused; renumber geometry refs. Returns {old_con_idx: new_con_idx}."""
+
+    def remap(g):
+        if g in geo_map:
+            return geo_map[g]
+        if g in (H_AXIS, V_AXIS, GEO_UNDEF):
+            return g
+        return None
+
+    kept = []
+    con_map = {}
+    for idx, con in enumerate(sketch.Constraints):
+        refs = [remap(g) for g in (con.First, con.Second, con.Third)]
+        if None in refs:
+            continue
+        con.First, con.Second, con.Third = refs
+        con_map[idx] = len(kept)
+        kept.append(con)
+    if kept:
+        new.addConstraint(kept)
+    return con_map
+
+
+def copy_expressions(sketch, new, con_map):
+    """Re-bind expressions on copied constraints. Returns paths that failed;
+    those constraints keep their current value."""
+    names = {c.Name for c in new.Constraints if c.Name}
+    failed = []
+    for path, expr in sketch.ExpressionEngine:
+        m = EXPR_CON_INDEX.match(path)
+        if m:
+            old = int(m.group(1))
+            if old not in con_map:
+                continue
+            target = "Constraints[{}]".format(con_map[old])
+        else:
+            m = EXPR_CON_NAME.match(path)
+            if not m or m.group(1) not in names:
+                continue
+            target = path
+        try:
+            new.setExpression(target, expr)
+        except Exception as e:
+            App.Console.PrintWarning(
+                "{}: could not copy expression {} = {}: {}\n".format(
+                    TITLE, path, expr, e
+                )
+            )
+            failed.append(path)
+    return failed
+
+
+def create_sibling_sketch(sketch):
+    """New sketch in the same container (Body/Part) with the same attachment."""
+    doc = sketch.Document
+    name = sketch.Name + "_BreakOut"
+    parent = sketch.getParentGeoFeatureGroup()
+    if parent is not None and hasattr(parent, "newObject"):
+        new = parent.newObject("Sketcher::SketchObject", name)
+    else:
+        new = doc.addObject("Sketcher::SketchObject", name)
+    new.Label = sketch.Label + "_BreakOut"
+
+    new.Placement = sketch.Placement
+    for prop in ("AttachmentSupport", "Support"):  # 1.x name, legacy name
+        if hasattr(sketch, prop):
+            try:
+                setattr(new, prop, getattr(sketch, prop))
+                break
+            except Exception:
+                pass
+    new.MapMode = sketch.MapMode
+    if hasattr(sketch, "AttachmentOffset"):
+        new.AttachmentOffset = sketch.AttachmentOffset
+    if hasattr(sketch, "MapReversed"):
+        new.MapReversed = sketch.MapReversed
+    return new
+
+
+def ask_mode(sketch, count):
+    box = QtGui.QMessageBox(Gui.getMainWindow())
+    box.setWindowTitle(TITLE)
+    box.setText(
+        "Move {} edge(s) to a new sketch.\n\n"
+        "What should happen to them in '{}'?".format(count, sketch.Label)
+    )
+    b_con = box.addButton("Make construction", QtGui.QMessageBox.AcceptRole)
+    b_del = box.addButton("Delete", QtGui.QMessageBox.DestructiveRole)
+    box.addButton(QtGui.QMessageBox.Cancel)
+    box.setDefaultButton(b_con)
+    box.exec_()
+    clicked = box.clickedButton()
+    if clicked == b_con:
+        return "construction"
+    if clicked == b_del:
+        return "delete"
+    return None
+
+
+def main():
+    sketch = get_sketch_in_edit()
+    if sketch is None:
+        warn("No active sketch being edited.")
+        return
+
+    ids = selected_geo_ids(sketch)
+    if not ids:
+        warn("No edges selected.")
+        return
+
+    mode = ask_mode(sketch, len(ids))
+    if mode is None:
+        return
+
+    doc = sketch.Document
+    doc.openTransaction(TITLE)
+    try:
+        new = create_sibling_sketch(sketch)
+
+        geo_map = copy_geometry(sketch, new, ids)
+        con_map = copy_constraints(sketch, new, geo_map)
+        failed = copy_expressions(sketch, new, con_map)
+
+        # Update the original sketch
+        Gui.Selection.clearSelection()
+        if mode == "delete":
+            sketch.delGeometries(ids)
+        else:
+            for i in ids:
+                if not sketch.getConstruction(i):
+                    sketch.setConstruction(i, True)
+
+        sketch.solve()
+        new.solve()
+        doc.recompute()
+        doc.commitTransaction()
+        App.Console.PrintMessage(
+            "{}: moved {} edge(s) from '{}' to '{}'\n".format(
+                TITLE, len(ids), sketch.Label, new.Label
+            )
+        )
+        if failed:
+            warn(
+                "{} expression(s) could not be copied. Check report view.".format(
+                    len(failed)
+                )
+            )
+    except Exception as e:
+        doc.abortTransaction()
+        warn("Failed: {}".format(e))
+        raise
+
+
+main()
