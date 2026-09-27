@@ -1,0 +1,176 @@
+# -*- coding: utf-8 -*-
+"""
+ExportHighQualitySTL.FCMacro
+
+Export the selection to STL with explicit tessellation tolerances.
+"""
+
+import math
+import os
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Mesh
+import MeshPart
+import Part
+from PySide import QtCore, QtGui
+
+TITLE = "Export high quality STL"
+PARAM_PATH = "User parameter:BaseApp/Preferences/Macros/ExportHighQualitySTL"
+GENERAL_PATH = "User parameter:BaseApp/Preferences/General"
+DEFAULT_DEVIATION = 0.01  # mm
+DEFAULT_ANGLE = 5.0  # degrees
+FACET_WARN = 2000000
+
+
+def warn(msg):
+    QtGui.QMessageBox.warning(Gui.getMainWindow(), TITLE, msg)
+
+
+def selected_sources():
+    sources = []
+    for obj in Gui.Selection.getSelection():
+        gpl = obj.getGlobalPlacement()
+        if obj.isDerivedFrom("Mesh::Feature"):
+            mesh = obj.Mesh.copy()
+            mesh.Placement = App.Placement()
+            mesh.transformGeometry(gpl.toMatrix())
+            sources.append((obj.Label, mesh))
+            continue
+        shape = Part.getShape(obj, transform=False)
+        if shape.isNull():
+            raise ValueError("'{}' has no shape or mesh.".format(obj.Label))
+        shape = shape.copy()
+        shape.Placement = gpl
+        sources.append((obj.Label, shape))
+    return sources
+
+
+def ask_path(default_name):
+    general = App.ParamGet(GENERAL_PATH)
+    start_dir = general.GetString("FileOpenSavePath", os.path.expanduser("~"))
+    path, _ = QtGui.QFileDialog.getSaveFileName(
+        Gui.getMainWindow(),
+        TITLE,
+        os.path.join(start_dir, default_name + ".stl"),
+        "STL (*.stl)",
+    )
+    if not path:
+        return None
+    if not path.lower().endswith(".stl"):
+        path += ".stl"
+    general.SetString("FileOpenSavePath", os.path.dirname(path))
+    return path
+
+
+def ask_tolerances():
+    """Returns (deviation_mm, angle_rad) or None."""
+    params = App.ParamGet(PARAM_PATH)
+
+    dlg = QtGui.QDialog(Gui.getMainWindow())
+    dlg.setWindowTitle(TITLE)
+    form = QtGui.QFormLayout(dlg)
+
+    dev = QtGui.QDoubleSpinBox()
+    dev.setDecimals(4)
+    dev.setRange(0.0001, 10.0)
+    dev.setSingleStep(0.005)
+    dev.setSuffix(" mm")
+    dev.setValue(params.GetFloat("MaxDeviation", DEFAULT_DEVIATION))
+    form.addRow("Max deviation:", dev)
+
+    ang = QtGui.QDoubleSpinBox()
+    ang.setDecimals(1)
+    ang.setRange(0.5, 90.0)
+    ang.setSingleStep(1.0)
+    ang.setSuffix(" °")
+    ang.setValue(params.GetFloat("MaxAngularDeflection", DEFAULT_ANGLE))
+    form.addRow("Max angular deflection:", ang)
+
+    buttons = QtGui.QDialogButtonBox(
+        QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel
+    )
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    form.addRow(buttons)
+
+    if not dlg.exec_():
+        return None
+    params.SetFloat("MaxDeviation", dev.value())
+    params.SetFloat("MaxAngularDeflection", ang.value())
+    return dev.value(), math.radians(ang.value())
+
+
+def build_mesh(sources, deviation, angle):
+    out = Mesh.Mesh()
+    for _label, src in sources:
+        if isinstance(src, Mesh.Mesh):
+            out.addMesh(src)
+        else:
+            out.addMesh(
+                MeshPart.meshFromShape(
+                    Shape=src,
+                    LinearDeflection=deviation,
+                    AngularDeflection=angle,
+                    Relative=False,
+                )
+            )
+    return out
+
+
+def confirm_large(count):
+    reply = QtGui.QMessageBox.question(
+        Gui.getMainWindow(),
+        TITLE,
+        "Mesh has {:,} facets. Write it anyway?".format(count),
+        QtGui.QMessageBox.Yes | QtGui.QMessageBox.No,
+        QtGui.QMessageBox.No,
+    )
+    return reply == QtGui.QMessageBox.Yes
+
+
+def main():
+    try:
+        sources = selected_sources()
+    except ValueError as e:
+        warn(str(e))
+        return
+    if not sources:
+        warn("Nothing selected.")
+        return
+
+    if len(sources) == 1:
+        default_name = sources[0][0]
+    else:
+        default_name = App.ActiveDocument.Name
+    path = ask_path(default_name)
+    if path is None:
+        return
+
+    tol = ask_tolerances()
+    if tol is None:
+        return
+    deviation, angle = tol
+
+    try:
+        QtGui.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            mesh = build_mesh(sources, deviation, angle)
+        finally:
+            QtGui.QApplication.restoreOverrideCursor()
+
+        if mesh.CountFacets > FACET_WARN and not confirm_large(mesh.CountFacets):
+            return
+
+        mesh.write(path)
+        App.Console.PrintMessage(
+            "{}: wrote {:,} facets to {} (deviation {} mm, angle {:.1f} deg)\n".format(
+                TITLE, mesh.CountFacets, path, deviation, math.degrees(angle)
+            )
+        )
+    except Exception as e:
+        warn("Failed: {}".format(e))
+        raise
+
+
+main()
