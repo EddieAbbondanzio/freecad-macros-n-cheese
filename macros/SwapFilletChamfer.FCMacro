@@ -1,0 +1,197 @@
+# -*- coding: utf-8 -*-
+"""
+SwapFilletChamfer.FCMacro
+
+Convert selected PartDesign Fillets to Chamfers and vice versa, 1:1.
+Fillet radius R <-> equal-distance chamfer of size R. Same edges, same slot in
+the Body, dependents relinked.
+"""
+
+import math
+import re
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtGui
+
+TITLE = "Swap fillet / chamfer"
+FILLET = "PartDesign::Fillet"
+CHAMFER = "PartDesign::Chamfer"
+DEFAULT_LABEL = re.compile(r"^(Fillet|Chamfer)\d*$")
+COPY_PROPS = ("Refine", "UseAllEdges")
+# Expressions on the size carry over; everything else is chamfer-only.
+EXPR_MAP = {FILLET: {"Radius": "Size"}, CHAMFER: {"Size": "Radius"}}
+
+
+def warn(msg):
+    QtGui.QMessageBox.warning(Gui.getMainWindow(), TITLE, msg)
+
+
+def chamfer_legs(ch):
+    """Returns (d1, d2) in mm."""
+    size = ch.Size.Value
+    if ch.ChamferType == "Equal distance":
+        return size, size
+    if ch.ChamferType == "Two distances":
+        return size, ch.Size2.Value
+    if ch.ChamferType == "Distance and Angle":
+        return size, size * math.tan(math.radians(ch.Angle.Value))
+    raise ValueError(
+        "'{}' has unknown ChamferType '{}'.".format(ch.Label, ch.ChamferType)
+    )
+
+
+def confirm_unequal(ch, d1, d2):
+    reply = QtGui.QMessageBox.warning(
+        Gui.getMainWindow(),
+        TITLE,
+        "'{}' is not equal-distance ({:.4g} mm x {:.4g} mm).\n\n"
+        "Convert anyway using {:.4g} mm as the fillet radius?".format(
+            ch.Label, d1, d2, d1
+        ),
+        QtGui.QMessageBox.Yes | QtGui.QMessageBox.No,
+        QtGui.QMessageBox.No,
+    )
+    return reply == QtGui.QMessageBox.Yes
+
+
+def plan(objs):
+    """Returns [(old, new_type, size_mm)], or None if the user bailed."""
+    out = []
+    for obj in objs:
+        if obj.TypeId == FILLET:
+            out.append((obj, CHAMFER, obj.Radius.Value))
+            continue
+        d1, d2 = chamfer_legs(obj)
+        if not math.isclose(d1, d2, rel_tol=1e-9, abs_tol=1e-7):
+            if not confirm_unequal(obj, d1, d2):
+                return None
+        out.append((obj, FILLET, d1))
+    return out
+
+
+def relink(dep, old, new):
+    """Point every link property on `dep` that targets `old` at `new`."""
+    for prop in dep.PropertiesList:
+        t = dep.getTypeIdOfProperty(prop)
+        if not t.startswith("App::PropertyLink") and not t.startswith(
+            "App::PropertyXLink"
+        ):
+            continue
+        val = getattr(dep, prop)
+        if val is None:
+            continue
+        if "SubList" in t:
+            if any(v[0] == old for v in val):
+                setattr(dep, prop, [(new if o == old else o, s) for o, s in val])
+        elif "List" in t:
+            if old in val:
+                setattr(dep, prop, [new if o == old else o for o in val])
+        elif "Sub" in t:
+            if val[0] == old:
+                setattr(dep, prop, (new, val[1]))
+        elif val == old:
+            setattr(dep, prop, new)
+
+
+def replace_feature(old, new_type, size):
+    """Returns (new, labels of dependents whose expressions reference `old`,
+    which can't be rewritten automatically)."""
+    body = old.getParentGeoFeatureGroup()
+    if body is None or body.TypeId != "PartDesign::Body":
+        raise ValueError("'{}' is not in a Body.".format(old.Label))
+
+    new = body.Document.addObject(new_type, new_type.split("::")[1])
+    # Insert after old so the next feature rebases onto new; removeObject then
+    # rebases new onto old's BaseFeature.
+    body.insertObject(new, old, True)
+    new.Base = old.Base
+    for prop in COPY_PROPS:
+        if hasattr(old, prop) and hasattr(new, prop):
+            setattr(new, prop, getattr(old, prop))
+    if new_type == CHAMFER:
+        new.ChamferType = "Equal distance"
+        new.Size = size
+    else:
+        new.Radius = size
+    for path, expr in old.ExpressionEngine:
+        target = EXPR_MAP[old.TypeId].get(path.lstrip("."))
+        if target:
+            new.setExpression(target, expr)
+
+    if not DEFAULT_LABEL.match(old.Label):
+        label = old.Label
+    else:
+        label = None
+
+    stale = []
+    for dep in old.InList:
+        if dep in (body, new):
+            continue
+        relink(dep, old, new)
+        if any(old.Name in e for _p, e in dep.ExpressionEngine):
+            stale.append(dep.Label)
+
+    was_tip = body.Tip == old
+    visible = old.Visibility
+    body.removeObject(old)
+    body.Document.removeObject(old.Name)
+    if was_tip:
+        body.Tip = new
+    new.Visibility = visible
+    if label:
+        new.Label = label
+    return new, stale
+
+
+def main():
+    sel = Gui.Selection.getSelection()
+    todo = [o for o in sel if o.TypeId in (FILLET, CHAMFER)]
+    if not todo:
+        warn("Select one or more PartDesign Fillet or Chamfer features.")
+        return
+    skipped = [o.Label for o in sel if o not in todo]
+    if skipped:
+        warn("Ignoring non fillet/chamfer selection: {}".format(", ".join(skipped)))
+
+    try:
+        jobs = plan(todo)
+    except ValueError as e:
+        warn(str(e))
+        return
+    if jobs is None:
+        return
+
+    doc = todo[0].Document
+    doc.openTransaction(TITLE)
+    try:
+        created = []
+        stale = []
+        for old, new_type, size in jobs:
+            old_label = old.Label
+            new, s = replace_feature(old, new_type, size)
+            created.append(new)
+            stale.extend(s)
+            App.Console.PrintMessage(
+                "{}: '{}' -> '{}' ({:.4g} mm)\n".format(
+                    TITLE, old_label, new.Label, size
+                )
+            )
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception as e:
+        doc.abortTransaction()
+        warn("Failed: {}".format(e))
+        raise
+
+    Gui.Selection.clearSelection()
+    for obj in created:
+        Gui.Selection.addSelection(obj)
+    if stale:
+        warn(
+            "These objects have expressions referencing a replaced feature and "
+            "need manual fixing:\n{}".format("\n".join(sorted(set(stale))))
+        )
+
+
+main()
